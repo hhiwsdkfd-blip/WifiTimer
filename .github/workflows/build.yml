@@ -1,0 +1,476 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Generate project files
+        run: |
+          mkdir -p wifitimer/app/src/main/java/com/example/wifitimer
+
+          cat > wifitimer/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WifiTimer"
+          include(":app")
+          EOF
+
+          cat > wifitimer/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > wifitimer/gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > wifitimer/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.wifitimer"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.wifitimer"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+
+          cat > wifitimer/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Wifi Timer"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".WifiOffReceiver"
+                      android:exported="false" />
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > wifitimer/app/src/main/java/com/example/wifitimer/TimerScheduler.kt <<'EOF'
+          package com.example.wifitimer
+
+          import android.app.AlarmManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.provider.Settings
+
+          object TimerScheduler {
+
+              private fun pendingIntent(ctx: Context): PendingIntent =
+                  PendingIntent.getBroadcast(
+                      ctx,
+                      0,
+                      Intent(ctx, WifiOffReceiver::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+
+              fun start(ctx: Context, minutes: Int): Boolean {
+                  val am = ctx.getSystemService(AlarmManager::class.java)
+
+                  if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
+                      ctx.startActivity(
+                          Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      return false
+                  }
+
+                  am.setExactAndAllowWhileIdle(
+                      AlarmManager.RTC_WAKEUP,
+                      System.currentTimeMillis() + minutes * 60_000L,
+                      pendingIntent(ctx)
+                  )
+                  return true
+              }
+
+              fun cancel(ctx: Context) {
+                  ctx.getSystemService(AlarmManager::class.java).cancel(pendingIntent(ctx))
+              }
+          }
+          EOF
+
+          cat > wifitimer/app/src/main/java/com/example/wifitimer/ShizukuWifi.kt <<'EOF'
+          package com.example.wifitimer
+
+          import android.content.pm.PackageManager
+          import rikka.shizuku.Shizuku
+
+          object ShizukuWifi {
+
+              const val REQUEST_CODE = 1001
+
+              fun isAvailable(): Boolean = try {
+                  Shizuku.pingBinder()
+              } catch (e: Throwable) {
+                  false
+              }
+
+              fun hasPermission(): Boolean = try {
+                  isAvailable() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) {
+                  false
+              }
+
+              fun requestPermission() {
+                  try {
+                      if (isAvailable() && !hasPermission()) Shizuku.requestPermission(REQUEST_CODE)
+                  } catch (e: Throwable) {
+                  }
+              }
+
+              fun disableWifi(): Boolean {
+                  if (hasPermission() && runViaShizuku()) return true
+                  return runViaRoot()
+              }
+
+              private fun runViaShizuku(): Boolean = try {
+                  val method = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess",
+                      Array<String>::class.java,
+                      Array<String>::class.java,
+                      String::class.java
+                  )
+                  method.isAccessible = true
+                  val process = method.invoke(
+                      null, arrayOf("sh", "-c", "svc wifi disable"), null, null
+                  ) as Process
+                  process.waitFor() == 0
+              } catch (e: Throwable) {
+                  false
+              }
+
+              private fun runViaRoot(): Boolean = try {
+                  val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "svc wifi disable"))
+                  p.waitFor() == 0
+              } catch (e: Throwable) {
+                  false
+              }
+          }
+          EOF
+
+          cat > wifitimer/app/src/main/java/com/example/wifitimer/WifiOffReceiver.kt <<'EOF'
+          package com.example.wifitimer
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.provider.Settings
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.core.content.ContextCompat
+
+          class WifiOffReceiver : BroadcastReceiver() {
+
+              @Suppress("DEPRECATION")
+              override fun onReceive(context: Context, intent: Intent) {
+                  val pending = goAsync()
+                  Thread {
+                      try {
+                          var ok = false
+                          if (Build.VERSION.SDK_INT < 29) {
+                              val wm = context.applicationContext
+                                  .getSystemService(Context.WIFI_SERVICE) as WifiManager
+                              ok = wm.setWifiEnabled(false)
+                          }
+                          if (!ok) ok = ShizukuWifi.disableWifi()
+                          if (!ok) showNotification(context)
+                      } finally {
+                          pending.finish()
+                      }
+                  }.start()
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun showNotification(context: Context) {
+                  val channelId = "wifi_timer_channel"
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val channel = NotificationChannel(
+                          channelId, "Wifi Timer", NotificationManager.IMPORTANCE_HIGH
+                      )
+                      context.getSystemService(NotificationManager::class.java)
+                          .createNotificationChannel(channel)
+                  }
+
+                  val target = if (Build.VERSION.SDK_INT >= 29) {
+                      Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)
+                  } else {
+                      Intent(Settings.ACTION_WIFI_SETTINGS)
+                  }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+                  val pi = PendingIntent.getActivity(
+                      context, 1, target, PendingIntent.FLAG_IMMUTABLE
+                  )
+
+                  val notification = NotificationCompat.Builder(context, channelId)
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle("ط§ظ†طھظ‡ظ‰ ط§ظ„ظ…ط¤ظ‚طھ")
+                      .setContentText("ط§ط¶ط؛ط· ظ„ط¥ط·ظپط§ط، ط§ظ„ظˆط§ظٹ ظپط§ظٹ")
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setContentIntent(pi)
+                      .setAutoCancel(true)
+                      .build()
+
+                  val granted = Build.VERSION.SDK_INT < 33 ||
+                      ContextCompat.checkSelfPermission(
+                          context, Manifest.permission.POST_NOTIFICATIONS
+                      ) == PackageManager.PERMISSION_GRANTED
+
+                  if (granted) {
+                      NotificationManagerCompat.from(context).notify(100, notification)
+                  }
+              }
+          }
+          EOF
+
+          cat > wifitimer/app/src/main/java/com/example/wifitimer/MainActivity.kt <<'EOF'
+          package com.example.wifitimer
+
+          import android.Manifest
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              WifiTimerScreen()
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun WifiTimerScreen() {
+              val context = LocalContext.current
+              var minutes by remember { mutableStateOf("") }
+              var status by remember { mutableStateOf("") }
+
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { }
+
+              LaunchedEffect(Unit) {
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+              }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .padding(24.dp),
+                  verticalArrangement = Arrangement.Center,
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Text("ظ…ط¤ظ‚طھ ط¥ظٹظ‚ط§ظپ ط§ظ„ظˆط§ظٹ ظپط§ظٹ", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(Modifier.height(24.dp))
+
+                  OutlinedTextField(
+                      value = minutes,
+                      onValueChange = { minutes = it.filter { c -> c.isDigit() } },
+                      label = { Text("ط§ظ„ظ…ط¯ط© ط¨ط§ظ„ط¯ظ‚ط§ط¦ظ‚") },
+                      singleLine = true,
+                      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                  )
+                  Spacer(Modifier.height(16.dp))
+
+                  Button(
+                      onClick = {
+                          val m = minutes.toIntOrNull()
+                          status = when {
+                              m == null || m <= 0 -> "ط£ط¯ط®ظ„ ط¹ط¯ط¯ ط¯ظ‚ط§ط¦ظ‚ طµط­ظٹط­"
+                              TimerScheduler.start(context, m) -> "طھظ… ط¶ط¨ط· ط§ظ„ظ…ط¤ظ‚طھ: $m ط¯ظ‚ظٹظ‚ط©"
+                              else -> "ظپط¹ظ‘ظ„ طµظ„ط§ط­ظٹط© ط§ظ„ظ…ظ†ط¨ظ‡ط§طھ ط§ظ„ط¯ظ‚ظٹظ‚ط© ط«ظ… ط§ط¶ط؛ط· ط§ط¨ط¯ط£ ظ…ط±ط© ط£ط®ط±ظ‰"
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth()
+                  ) { Text("ط§ط¨ط¯ط£") }
+
+                  Spacer(Modifier.height(8.dp))
+
+                  OutlinedButton(
+                      onClick = {
+                          TimerScheduler.cancel(context)
+                          status = "طھظ… ط¥ظ„ط؛ط§ط، ط§ظ„ظ…ط¤ظ‚طھ"
+                      },
+                      modifier = Modifier.fillMaxWidth()
+                  ) { Text("ط¥ظ„ط؛ط§ط،") }
+
+                  Spacer(Modifier.height(8.dp))
+
+                  OutlinedButton(
+                      onClick = {
+                          status = when {
+                              !ShizukuWifi.isAvailable() -> "ط´ط؛ظ‘ظ„ طھط·ط¨ظٹظ‚ Shizuku ط£ظˆظ„ط§ظ‹"
+                              ShizukuWifi.hasPermission() -> "Shizuku ط¬ط§ظ‡ط²"
+                              else -> {
+                                  ShizukuWifi.requestPermission()
+                                  "ط§ط³ظ…ط­ ظ„ظ„طھط·ط¨ظٹظ‚ ظپظٹ ظ†ط§ظپط°ط© Shizuku ط«ظ… ط§ط¶ط؛ط· ط§ظ„ط²ط± ظ…ط±ط© ط£ط®ط±ظ‰"
+                              }
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth()
+                  ) { Text("طھظپط¹ظٹظ„ Shizuku (ظٹط¹ظ…ظ„ ظ…ط¹ ط§ظ„ط´ط§ط´ط© ط§ظ„ظ…ظ‚ظپظ„ط©)") }
+
+                  Spacer(Modifier.height(16.dp))
+                  Text(status)
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        working-directory: wifitimer
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WifiTimer-APK
+          path: wifitimer/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: WifiTimer v${{ github.run_number }}
+          files: wifitimer/app/build/outputs/apk/debug/app-debug.apk
